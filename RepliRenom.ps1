@@ -3,6 +3,14 @@ $sourceFolder = "C:\Ruta\De\Carpeta1"
 $destinationFolder = "C:\Ruta\De\Carpeta2"
 $bufferSize = 65536  # 64KB buffer para lectura óptima en discos mecánicos
 
+# Validar versión de PowerShell
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Warning "PowerShell 7+ recomendado para mejor rendimiento. Usando TransformBlock."
+    $useIncrementalHash = $false
+} else {
+    $useIncrementalHash = $true
+}
+
 # Validar que las carpetas existen
 if (-not (Test-Path $sourceFolder)) {
     Write-Error "La carpeta de origen no existe: $sourceFolder"
@@ -14,27 +22,44 @@ if (-not (Test-Path $destinationFolder)) {
     exit 1
 }
 
-# Función de checksum optimizada para discos mecánicos
+# Función de checksum optimizada con IncrementalHash (PowerShell 7+) o TransformBlock
 function Get-FileChecksum {
     param([string]$filePath)
     
+    $fileStream = $null
+    $hash = $null
+    
     try {
-        $sha256 = [System.Security.Cryptography.SHA256]::Create()
         $fileStream = [System.IO.File]::OpenRead($filePath)
         
-        # Leer en bloques de 64KB (óptimo para discos mecánicos)
-        $buffer = New-Object byte[] $bufferSize
-        $bytesRead = 0
-        
-        while (($bytesRead = $fileStream.Read($buffer, 0, $bufferSize)) -gt 0) {
-            $sha256.TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
+        if ($useIncrementalHash) {
+            # IncrementalHash: más limpio y nativo de .NET 5+
+            $hash = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256
+            )
+            
+            $buffer = New-Object byte[] $bufferSize
+            $bytesRead = 0
+            
+            while (($bytesRead = $fileStream.Read($buffer, 0, $bufferSize)) -gt 0) {
+                $hash.AppendData($buffer, 0, $bytesRead)
+            }
+            
+            $checksum = $hash.GetHashAndReset()
+        } else {
+            # TransformBlock: compatible con PowerShell 5.1
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            $buffer = New-Object byte[] $bufferSize
+            $bytesRead = 0
+            
+            while (($bytesRead = $fileStream.Read($buffer, 0, $bufferSize)) -gt 0) {
+                $sha256.TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
+            }
+            
+            $sha256.TransformFinalBlock($buffer, 0, 0) | Out-Null
+            $checksum = $sha256.Hash
+            $sha256.Dispose()
         }
-        
-        $sha256.TransformFinalBlock($buffer, 0, 0) | Out-Null
-        $checksum = $sha256.Hash
-        
-        $fileStream.Close()
-        $sha256.Dispose()
         
         return -join ($checksum | ForEach-Object { "{0:x2}" -f $_ })
     }
@@ -42,8 +67,19 @@ function Get-FileChecksum {
         Write-Error "Error en $filePath : $_"
         return $null
     }
+    finally {
+        if ($fileStream) {
+            $fileStream.Close()
+            $fileStream.Dispose()
+        }
+        if ($hash) {
+            $hash.Dispose()
+        }
+    }
 }
 
+Write-Host "PowerShell versión: $($PSVersionTable.PSVersion)" -ForegroundColor Cyan
+Write-Host "Usando: $(if ($useIncrementalHash) { 'IncrementalHash' } else { 'TransformBlock' })" -ForegroundColor Yellow
 Write-Host "Leyendo archivos..." -ForegroundColor Cyan
 
 $sourceFiles = @(Get-ChildItem -Path $sourceFolder -File -Recurse)
@@ -72,6 +108,7 @@ foreach ($file in $destFiles) {
 $renombrados = 0
 $noCoinciden = 0
 $checksumCache = @{}
+$processedDestPaths = @{}
 
 # Procesar por orden de tamaño (archivos pequeños primero para verificación rápida)
 $sortedSource = $sourceFiles | Sort-Object -Property Length
@@ -88,13 +125,11 @@ foreach ($src in $sortedSource) {
     if ($destByNameSize.ContainsKey($nameSizeKey)) {
         $existingFile = $destByNameSize[$nameSizeKey]
         
-        # Si ya existe con el mismo nombre y tamaño, saltar
         Write-Host "Existe: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
         continue
     }
     
     # PASO 2: Si no existe, proceder a comparar por checksum
-    # Cache del checksum origen usando solo tamaño (independiente de timestamps)
     $srcCacheKey = "$($src.FullName)|$($src.Length)"
     if ($checksumCache.ContainsKey($srcCacheKey)) {
         $srcChecksum = $checksumCache[$srcCacheKey]
@@ -109,20 +144,22 @@ foreach ($src in $sortedSource) {
         $checksumCache[$srcCacheKey] = $srcChecksum
     }
     
-    $encontrado = $false
-    
     foreach ($dest in $candidates) {
+        # Saltar si ya ha sido procesado
+        if ($processedDestPaths.ContainsKey($dest.FullName)) {
+            continue
+        }
+        
         # Saltar si es el mismo archivo físico
         if ($dest.FullName -eq $src.FullName) {
             continue
         }
         
-        # Saltar si ya existe con el mismo nombre (pero continuar con otros candidatos)
+        # Saltar si ya existe con el mismo nombre
         if ($dest.Name -eq $src.Name) {
             continue
         }
         
-        # Cache del checksum destino usando solo tamaño y ruta (sin timestamp)
         $destCacheKey = "$($dest.FullName)|$($dest.Length)"
         if ($checksumCache.ContainsKey($destCacheKey)) {
             $destChecksum = $checksumCache[$destCacheKey]
@@ -147,11 +184,19 @@ foreach ($src in $sortedSource) {
                     Write-Host "✓ Renombrando: $($dest.Name) → $($src.Name)" -ForegroundColor Green
                     Rename-Item -Path $dest.FullName -NewName $src.Name -Force -ErrorAction Stop
                     
-                    # Actualizar índices
-                    $destByNameSize["$($src.Name)|$($src.Length)"] = $dest
+                    $processedDestPaths[$dest.FullName] = $true
+                    
+                    $destByNameSize[$nameSizeKey] = $dest
+                    
+                    $oldNameSizeKey = "$($dest.Name)|$($dest.Length)"
+                    if ($destByNameSize.ContainsKey($oldNameSizeKey)) {
+                        $destByNameSize.Remove($oldNameSizeKey)
+                    }
+                    
+                    $dest | Add-Member -MemberType NoteProperty -Name "FullName" -Value $newPath -Force
+                    $dest | Add-Member -MemberType NoteProperty -Name "Name" -Value $src.Name -Force
                     
                     $renombrados++
-                    $encontrado = $true
                     break
                 } catch {
                     Write-Error "✗ Error: $_"
