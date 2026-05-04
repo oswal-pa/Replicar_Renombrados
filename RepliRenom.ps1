@@ -260,7 +260,7 @@ function Procesar-Lote {
                 }
                 
                 try {
-                    Write-Host "✓ Renombrando: $($destMeta.Name) → $($src.Name)" -ForegroundColor Green
+                    Write-Host "✓ Renombrando: $($destMeta.Name) -> $($src.Name)" -ForegroundColor Green
                     Rename-Item -Path $destMeta.FullPath -NewName $src.Name -Force -ErrorAction Stop
                     
                     $oldFullPath = $destMeta.FullPath
