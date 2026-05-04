@@ -44,36 +44,30 @@ function Get-FileChecksum {
     }
 }
 
-# Usar GetFilesBySize para comparación inicial más rápida
-function Compare-FilesOptimized {
-    param(
-        [object[]]$sourceFiles,
-        [object[]]$destFiles
-    )
-    
-    # Agrupar por tamaño
-    $destBySize = @{}
-    foreach ($file in $destFiles) {
-        $key = $file.Length
-        if (-not $destBySize.ContainsKey($key)) {
-            $destBySize[$key] = @()
-        }
-        $destBySize[$key] += $file
-    }
-    
-    return $destBySize
-}
-
 Write-Host "Leyendo archivos..." -ForegroundColor Cyan
 
 $sourceFiles = @(Get-ChildItem -Path $sourceFolder -File -Recurse)
 $destFiles = @(Get-ChildItem -Path $destinationFolder -File -Recurse)
 
 Write-Host "Archivos origen: $($sourceFiles.Count)" -ForegroundColor Green
-Write-Host "Archivos destino: $($destFiles.Count)" -ForegroundColor Green
+Write-Host "Archivos destino: $($destFiles.Count)" -ForegroundColor Red
 
-# Crear mapa de destinos por tamaño
-$destBySize = Compare-FilesOptimized -sourceFiles $sourceFiles -destFiles $destFiles
+# Crear índices por tamaño y nombre+tamaño
+$destBySize = @{}
+$destByNameSize = @{}
+
+foreach ($file in $destFiles) {
+    # Índice por tamaño
+    $sizeKey = $file.Length
+    if (-not $destBySize.ContainsKey($sizeKey)) {
+        $destBySize[$sizeKey] = @()
+    }
+    $destBySize[$sizeKey] += $file
+    
+    # Índice por nombre+tamaño para búsqueda rápida
+    $nameSizeKey = "$($file.Name)|$($file.Length)"
+    $destByNameSize[$nameSizeKey] = $file
+}
 
 $renombrados = 0
 $noCoinciden = 0
@@ -89,10 +83,21 @@ foreach ($src in $sortedSource) {
         continue
     }
     
-    # Cache del checksum origen
-    $srcKey = "$($src.FullName)|$($src.Length)|$($src.LastWriteTime)"
-    if ($checksumCache.ContainsKey($srcKey)) {
-        $srcChecksum = $checksumCache[$srcKey]
+    # PASO 1: Comprobar si existe en destino con el mismo nombre y tamaño
+    $nameSizeKey = "$($src.Name)|$($src.Length)"
+    if ($destByNameSize.ContainsKey($nameSizeKey)) {
+        $existingFile = $destByNameSize[$nameSizeKey]
+        
+        # Si ya existe con el mismo nombre y tamaño, saltar
+        Write-Host "Existe: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
+        continue
+    }
+    
+    # PASO 2: Si no existe, proceder a comparar por checksum
+    # Cache del checksum origen usando solo tamaño (independiente de timestamps)
+    $srcCacheKey = "$($src.FullName)|$($src.Length)"
+    if ($checksumCache.ContainsKey($srcCacheKey)) {
+        $srcChecksum = $checksumCache[$srcCacheKey]
     } else {
         Write-Host "Calculando checksum: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
         $srcChecksum = Get-FileChecksum $src.FullName
@@ -101,18 +106,26 @@ foreach ($src in $sortedSource) {
             continue
         }
         
-        $checksumCache[$srcKey] = $srcChecksum
+        $checksumCache[$srcCacheKey] = $srcChecksum
     }
     
+    $encontrado = $false
+    
     foreach ($dest in $candidates) {
-        if ($dest.Name -eq $src.Name) {
-            break
+        # Saltar si es el mismo archivo físico
+        if ($dest.FullName -eq $src.FullName) {
+            continue
         }
         
-        # Cache del checksum destino
-        $destKey = "$($dest.FullName)|$($dest.Length)|$($dest.LastWriteTime)"
-        if ($checksumCache.ContainsKey($destKey)) {
-            $destChecksum = $checksumCache[$destKey]
+        # Saltar si ya existe con el mismo nombre (pero continuar con otros candidatos)
+        if ($dest.Name -eq $src.Name) {
+            continue
+        }
+        
+        # Cache del checksum destino usando solo tamaño y ruta (sin timestamp)
+        $destCacheKey = "$($dest.FullName)|$($dest.Length)"
+        if ($checksumCache.ContainsKey($destCacheKey)) {
+            $destChecksum = $checksumCache[$destCacheKey]
         } else {
             $destChecksum = Get-FileChecksum $dest.FullName
             
@@ -120,7 +133,7 @@ foreach ($src in $sortedSource) {
                 continue
             }
             
-            $checksumCache[$destKey] = $destChecksum
+            $checksumCache[$destCacheKey] = $destChecksum
         }
         
         if ($srcChecksum -eq $destChecksum) {
@@ -133,13 +146,18 @@ foreach ($src in $sortedSource) {
                 try {
                     Write-Host "✓ Renombrando: $($dest.Name) → $($src.Name)" -ForegroundColor Green
                     Rename-Item -Path $dest.FullName -NewName $src.Name -Force -ErrorAction Stop
+                    
+                    # Actualizar índices
+                    $destByNameSize["$($src.Name)|$($src.Length)"] = $dest
+                    
                     $renombrados++
+                    $encontrado = $true
+                    break
                 } catch {
                     Write-Error "✗ Error: $_"
                     $noCoinciden++
                 }
             }
-            break
         }
     }
 }
