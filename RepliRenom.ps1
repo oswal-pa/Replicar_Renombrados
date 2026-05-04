@@ -3,24 +3,7 @@ $sourceFolder = "C:\Ruta\De\Carpeta1"
 $destinationFolder = "C:\Ruta\De\Carpeta2"
 $batchSize = 1000    # Procesar archivos en lotes de 1000
 $maxPathLength = 260 # Límite de Windows para rutas (260 caracteres)
-
-#Optimizar según el tipo de disco
-function Get-BufferSize {
-    $drive = Get-WmiObject Win32_DiskDrive | Select-Object -First 1
-    if ($drive.DriveType -eq 3) { 
-        # This indicates it's a physical drive
-        if ($drive.SerialNumber -match "^.*SSD.*$") {
-            return 512KB  # For NVMe
-        } elseif ($drive.SerialNumber -match "^.*HDD.*$") {
-            return 64KB  # For HDD
-        } else {
-            return 256KB  # For SSD
-        }
-    }
-    return 64KB  # Default buffer size
-}
-
-$bufferSize = Get-BufferSize
+$bufferSize = 65536  # 64KB buffer para lectura óptima en discos mecánicos
 
 # Validar versión de PowerShell
 if ($PSVersionTable.PSVersion.Major -lt 7) {
