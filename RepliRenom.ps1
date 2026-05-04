@@ -310,7 +310,7 @@ function Procesar-Lote {
 }
 
 Write-Host "PowerShell versión: $($PSVersionTable.PSVersion)" -ForegroundColor Cyan
-Write-Host "Usando: $(if ($useIncrementalHash) { 'IncrementalHash' } else { 'TransformBlock' })" -ForegroundColor Yellow
+Write-Host "Usando: $(if ($useIncrementalHash) { "IncrementalHash" } else { "TransformBlock" })" -ForegroundColor Yellow
 Write-Host "Leyendo archivos en streaming..." -ForegroundColor Cyan
 
 $destBySize = @{}
