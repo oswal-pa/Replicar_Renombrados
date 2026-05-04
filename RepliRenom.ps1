@@ -159,6 +159,156 @@ function Get-FileChecksum {
     }
 }
 
+# Función auxiliar para procesar lotes
+function Procesar-Lote {
+    param(
+        [object[]]$batch,
+        [hashtable]$destBySize,
+        [hashtable]$destByNameSize,
+        [hashtable]$checksumCache,
+        [hashtable]$processedDestPaths,
+        [ref]$renombrados,
+        [ref]$noCoinciden,
+        [ref]$errorLog
+    )
+    
+    foreach ($src in $batch) {
+        $candidates = $destBySize[$src.Length]
+        
+        if (-not $candidates) {
+            continue
+        }
+        
+        $nameSizeKey = "$($src.Name)|$($src.Length)"
+        if ($destByNameSize.ContainsKey($nameSizeKey)) {
+            Write-Host "Existe: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
+            continue
+        }
+        
+        $srcCacheKey = "$($src.FullName)|$($src.Length)"
+        if ($checksumCache.ContainsKey($srcCacheKey)) {
+            $srcChecksum = $checksumCache[$srcCacheKey]
+        } else {
+            Write-Host "Calculando checksum: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
+            $srcChecksum = Get-FileChecksum $src.FullName
+            
+            if ($null -eq $srcChecksum) {
+                continue
+            }
+            
+            $checksumCache[$srcCacheKey] = $srcChecksum
+        }
+        
+        $candidateIndex = 0
+        foreach ($destMeta in $candidates) {
+            if ($processedDestPaths.ContainsKey($destMeta.FullPath)) {
+                $candidateIndex++
+                continue
+            }
+            
+            if ($destMeta.FullPath -eq $src.FullName) {
+                $candidateIndex++
+                continue
+            }
+            
+            if ($destMeta.Name -eq $src.Name) {
+                $candidateIndex++
+                continue
+            }
+            
+            $destCacheKey = "$($destMeta.FullPath)|$($destMeta.Length)"
+            if ($checksumCache.ContainsKey($destCacheKey)) {
+                $destChecksum = $checksumCache[$destCacheKey]
+            } else {
+                $destChecksum = Get-FileChecksum $destMeta.FullPath
+                
+                if ($null -eq $destChecksum) {
+                    $candidateIndex++
+                    continue
+                }
+                
+                $checksumCache[$destCacheKey] = $destChecksum
+            }
+            
+            if ($srcChecksum -eq $destChecksum) {
+                $newPath = Join-Path -Path (Split-Path -Path $destMeta.FullPath) -ChildPath $src.Name
+                
+                # Verificar longitud de nueva ruta
+                if (-not (Test-PathLength $newPath)) {
+                    Write-Warning "Nueva ruta demasiado larga: $newPath"
+                    $noCoinciden.Value++
+                    $errorLog.Value += "Nueva ruta larga: $newPath"
+                    $candidateIndex++
+                    continue
+                }
+                
+                if (Test-Path $newPath) {
+                    Write-Warning "Existe: $newPath"
+                    $noCoinciden.Value++
+                    $candidateIndex++
+                    continue
+                }
+                
+                # Verificar permisos de escritura
+                $parentDir = Split-Path -Path $destMeta.FullPath
+                if (-not (Test-WritePermission $parentDir)) {
+                    Write-Warning "Sin permisos de escritura en: $parentDir"
+                    $noCoinciden.Value++
+                    $errorLog.Value += "Sin permisos de escritura: $parentDir"
+                    $candidateIndex++
+                    continue
+                }
+                
+                try {
+                    Write-Host "✓ Renombrando: $($destMeta.Name) → $($src.Name)" -ForegroundColor Green
+                    Rename-Item -Path $destMeta.FullPath -NewName $src.Name -Force -ErrorAction Stop
+                    
+                    $oldFullPath = $destMeta.FullPath
+                    $processedDestPaths[$oldFullPath] = $true
+                    
+                    $oldNameSizeKey = "$($destMeta.Name)|$($destMeta.Length)"
+                    if ($destByNameSize.ContainsKey($oldNameSizeKey)) {
+                        $destByNameSize.Remove($oldNameSizeKey)
+                    }
+                    
+                    $destByNameSize[$nameSizeKey] = @{
+                        FullPath = $newPath
+                        Name = $src.Name
+                        Length = $src.Length
+                    }
+                    
+                    $candidates[$candidateIndex] = @{
+                        FullPath = $newPath
+                        Name = $src.Name
+                        Length = $src.Length
+                    }
+                    
+                    $checksumCache.Remove($destCacheKey)
+                    $newCacheKey = "$($newPath)|$($src.Length)"
+                    $checksumCache[$newCacheKey] = $destChecksum
+                    
+                    $renombrados.Value++
+                    break
+                } catch [System.UnauthorizedAccessException] {
+                    Write-Error "✗ Acceso denegado al renombrar: $($destMeta.FullPath)"
+                    $noCoinciden.Value++
+                    $errorLog.Value += "Acceso denegado: $($destMeta.FullPath)"
+                } catch [System.IO.IOException] {
+                    Write-Error "✗ Error de I/O al renombrar: $($destMeta.FullPath) - $_"
+                    $noCoinciden.Value++
+                    $errorLog.Value += "Error I/O: $($destMeta.FullPath)"
+                } catch {
+                    Write-Error "✗ Error: $_"
+                    $noCoinciden.Value++
+                    $errorLog.Value += "Error renombrado: $($destMeta.FullPath) - $_"
+                }
+            }
+            
+            $candidateIndex++
+        }
+    }
+}
+
 Write-Host "PowerShell versión: $($PSVersionTable.PSVersion)" -ForegroundColor Cyan
 Write-Host "Usando: $(if ($useIncrementalHash) { 'IncrementalHash' } else { 'TransformBlock' })" -ForegroundColor Yellow
 Write-Host "Leyendo archivos en streaming..." -ForegroundColor Cyan
@@ -316,156 +466,6 @@ if ($batch.Count -gt 0) {
         -checksumCache $checksumCache -processedDestPaths $processedDestPaths `
         -renombrados ([ref]$renombrados) -noCoinciden ([ref]$noCoinciden) `
         -errorLog ([ref]$errorLog)
-}
-
-# Función auxiliar para procesar lotes
-function Procesar-Lote {
-    param(
-        [object[]]$batch,
-        [hashtable]$destBySize,
-        [hashtable]$destByNameSize,
-        [hashtable]$checksumCache,
-        [hashtable]$processedDestPaths,
-        [ref]$renombrados,
-        [ref]$noCoinciden,
-        [ref]$errorLog
-    )
-    
-    foreach ($src in $batch) {
-        $candidates = $destBySize[$src.Length]
-        
-        if (-not $candidates) {
-            continue
-        }
-        
-        $nameSizeKey = "$($src.Name)|$($src.Length)"
-        if ($destByNameSize.ContainsKey($nameSizeKey)) {
-            Write-Host "Existe: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
-            continue
-        }
-        
-        $srcCacheKey = "$($src.FullName)|$($src.Length)"
-        if ($checksumCache.ContainsKey($srcCacheKey)) {
-            $srcChecksum = $checksumCache[$srcCacheKey]
-        } else {
-            Write-Host "Calculando checksum: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
-            $srcChecksum = Get-FileChecksum $src.FullName
-            
-            if ($null -eq $srcChecksum) {
-                continue
-            }
-            
-            $checksumCache[$srcCacheKey] = $srcChecksum
-        }
-        
-        $candidateIndex = 0
-        foreach ($destMeta in $candidates) {
-            if ($processedDestPaths.ContainsKey($destMeta.FullPath)) {
-                $candidateIndex++
-                continue
-            }
-            
-            if ($destMeta.FullPath -eq $src.FullName) {
-                $candidateIndex++
-                continue
-            }
-            
-            if ($destMeta.Name -eq $src.Name) {
-                $candidateIndex++
-                continue
-            }
-            
-            $destCacheKey = "$($destMeta.FullPath)|$($destMeta.Length)"
-            if ($checksumCache.ContainsKey($destCacheKey)) {
-                $destChecksum = $checksumCache[$destCacheKey]
-            } else {
-                $destChecksum = Get-FileChecksum $destMeta.FullPath
-                
-                if ($null -eq $destChecksum) {
-                    $candidateIndex++
-                    continue
-                }
-                
-                $checksumCache[$destCacheKey] = $destChecksum
-            }
-            
-            if ($srcChecksum -eq $destChecksum) {
-                $newPath = Join-Path -Path (Split-Path -Path $destMeta.FullPath) -ChildPath $src.Name
-                
-                # Verificar longitud de nueva ruta
-                if (-not (Test-PathLength $newPath)) {
-                    Write-Warning "Nueva ruta demasiado larga: $newPath"
-                    $noCoinciden.Value++
-                    $errorLog.Value += "Nueva ruta larga: $newPath"
-                    $candidateIndex++
-                    continue
-                }
-                
-                if (Test-Path $newPath) {
-                    Write-Warning "Existe: $newPath"
-                    $noCoinciden.Value++
-                    $candidateIndex++
-                    continue
-                }
-                
-                # Verificar permisos de escritura
-                $parentDir = Split-Path -Path $destMeta.FullPath
-                if (-not (Test-WritePermission $parentDir)) {
-                    Write-Warning "Sin permisos de escritura en: $parentDir"
-                    $noCoinciden.Value++
-                    $errorLog.Value += "Sin permisos de escritura: $parentDir"
-                    $candidateIndex++
-                    continue
-                }
-                
-                try {
-                    Write-Host "✓ Renombrando: $($destMeta.Name) → $($src.Name)" -ForegroundColor Green
-                    Rename-Item -Path $destMeta.FullPath -NewName $src.Name -Force -ErrorAction Stop
-                    
-                    $oldFullPath = $destMeta.FullPath
-                    $processedDestPaths[$oldFullPath] = $true
-                    
-                    $oldNameSizeKey = "$($destMeta.Name)|$($destMeta.Length)"
-                    if ($destByNameSize.ContainsKey($oldNameSizeKey)) {
-                        $destByNameSize.Remove($oldNameSizeKey)
-                    }
-                    
-                    $destByNameSize[$nameSizeKey] = @{
-                        FullPath = $newPath
-                        Name = $src.Name
-                        Length = $src.Length
-                    }
-                    
-                    $candidates[$candidateIndex] = @{
-                        FullPath = $newPath
-                        Name = $src.Name
-                        Length = $src.Length
-                    }
-                    
-                    $checksumCache.Remove($destCacheKey)
-                    $newCacheKey = "$($newPath)|$($src.Length)"
-                    $checksumCache[$newCacheKey] = $destChecksum
-                    
-                    $renombrados.Value++
-                    break
-                } catch [System.UnauthorizedAccessException] {
-                    Write-Error "✗ Acceso denegado al renombrar: $($destMeta.FullPath)"
-                    $noCoinciden.Value++
-                    $errorLog.Value += "Acceso denegado: $($destMeta.FullPath)"
-                } catch [System.IO.IOException] {
-                    Write-Error "✗ Error de I/O al renombrar: $($destMeta.FullPath) - $_"
-                    $noCoinciden.Value++
-                    $errorLog.Value += "Error I/O: $($destMeta.FullPath)"
-                } catch {
-                    Write-Error "✗ Error: $_"
-                    $noCoinciden.Value++
-                    $errorLog.Value += "Error renombrado: $($destMeta.FullPath) - $_"
-                }
-            }
-            
-            $candidateIndex++
-        }
-    }
 }
 
 Write-Host "`n════════════════════════════════════" -ForegroundColor Cyan
