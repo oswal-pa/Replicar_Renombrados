@@ -1,6 +1,7 @@
 # Configuración
 $sourceFolder = "C:\Ruta\De\Carpeta1"
 $destinationFolder = "C:\Ruta\De\Carpeta2"
+$bufferSize = 65536  # 64KB buffer para lectura óptima en discos mecánicos
 
 # Validar que las carpetas existen
 if (-not (Test-Path $sourceFolder)) {
@@ -13,15 +14,26 @@ if (-not (Test-Path $destinationFolder)) {
     exit 1
 }
 
-# Función optimizada para calcular SHA256
+# Función de checksum optimizada para discos mecánicos
 function Get-FileChecksum {
     param([string]$filePath)
     
     try {
         $sha256 = [System.Security.Cryptography.SHA256]::Create()
         $fileStream = [System.IO.File]::OpenRead($filePath)
-        $checksum = $sha256.ComputeHash($fileStream)
-        $fileStream.Dispose()
+        
+        # Leer en bloques de 64KB (óptimo para discos mecánicos)
+        $buffer = New-Object byte[] $bufferSize
+        $bytesRead = 0
+        
+        while (($bytesRead = $fileStream.Read($buffer, 0, $bufferSize)) -gt 0) {
+            $sha256.TransformBlock($buffer, 0, $bytesRead, $null, 0) | Out-Null
+        }
+        
+        $sha256.TransformFinalBlock($buffer, 0, 0) | Out-Null
+        $checksum = $sha256.Hash
+        
+        $fileStream.Close()
         $sha256.Dispose()
         
         return -join ($checksum | ForEach-Object { "{0:x2}" -f $_ })
@@ -32,63 +44,85 @@ function Get-FileChecksum {
     }
 }
 
+# Usar GetFilesBySize para comparación inicial más rápida
+function Compare-FilesOptimized {
+    param(
+        [object[]]$sourceFiles,
+        [object[]]$destFiles
+    )
+    
+    # Agrupar por tamaño
+    $destBySize = @{}
+    foreach ($file in $destFiles) {
+        $key = $file.Length
+        if (-not $destBySize.ContainsKey($key)) {
+            $destBySize[$key] = @()
+        }
+        $destBySize[$key] += $file
+    }
+    
+    return $destBySize
+}
+
 Write-Host "Leyendo archivos..." -ForegroundColor Cyan
 
-# Obtener archivos y agrupar por tamaño (O(n) lookup)
 $sourceFiles = @(Get-ChildItem -Path $sourceFolder -File -Recurse)
 $destFiles = @(Get-ChildItem -Path $destinationFolder -File -Recurse)
-
-# Crear hash tables para búsqueda rápida O(1)
-$destBySize = @{}
-$destByChecksum = @{}
-
-# Agrupar destino por tamaño
-foreach ($file in $destFiles) {
-    if (-not $destBySize.ContainsKey($file.Length)) {
-        $destBySize[$file.Length] = @()
-    }
-    $destBySize[$file.Length] += $file
-}
 
 Write-Host "Archivos origen: $($sourceFiles.Count)" -ForegroundColor Green
 Write-Host "Archivos destino: $($destFiles.Count)" -ForegroundColor Green
 
+# Crear mapa de destinos por tamaño
+$destBySize = Compare-FilesOptimized -sourceFiles $sourceFiles -destFiles $destFiles
+
 $renombrados = 0
 $noCoinciden = 0
+$checksumCache = @{}
 
-# Procesar archivos origen
-foreach ($src in $sourceFiles) {
-    # Buscar solo archivos con el mismo tamaño (salto rápido)
+# Procesar por orden de tamaño (archivos pequeños primero para verificación rápida)
+$sortedSource = $sourceFiles | Sort-Object -Property Length
+
+foreach ($src in $sortedSource) {
     $candidates = $destBySize[$src.Length]
     
     if (-not $candidates) {
         continue
     }
     
-    $srcChecksum = Get-FileChecksum $src.FullName
-    if ($null -eq $srcChecksum) {
-        continue
+    # Cache del checksum origen
+    $srcKey = "$($src.FullName)|$($src.Length)|$($src.LastWriteTime)"
+    if ($checksumCache.ContainsKey($srcKey)) {
+        $srcChecksum = $checksumCache[$srcKey]
+    } else {
+        Write-Host "Calculando checksum: $($src.Name) [$([Math]::Round($src.Length/1MB, 2))MB]" -ForegroundColor DarkGray
+        $srcChecksum = Get-FileChecksum $src.FullName
+        
+        if ($null -eq $srcChecksum) {
+            continue
+        }
+        
+        $checksumCache[$srcKey] = $srcChecksum
     }
     
     foreach ($dest in $candidates) {
-        # Saltar si ya tienen el mismo nombre
         if ($dest.Name -eq $src.Name) {
             break
         }
         
-        # Evitar recalcular checksums del mismo archivo
-        $cacheKey = "$($dest.FullName)|$($dest.Length)"
-        if ($destByChecksum.ContainsKey($cacheKey)) {
-            $destChecksum = $destByChecksum[$cacheKey]
+        # Cache del checksum destino
+        $destKey = "$($dest.FullName)|$($dest.Length)|$($dest.LastWriteTime)"
+        if ($checksumCache.ContainsKey($destKey)) {
+            $destChecksum = $checksumCache[$destKey]
         } else {
             $destChecksum = Get-FileChecksum $dest.FullName
+            
             if ($null -eq $destChecksum) {
                 continue
             }
-            $destByChecksum[$cacheKey] = $destChecksum
+            
+            $checksumCache[$destKey] = $destChecksum
         }
         
-        # Comparar checksums
         if ($srcChecksum -eq $destChecksum) {
             $newPath = Join-Path -Path $dest.DirectoryName -ChildPath $src.Name
             
@@ -97,14 +131,11 @@ foreach ($src in $sourceFiles) {
                 $noCoinciden++
             } else {
                 try {
-                    Write-Host "Renombrando: $($dest.Name) → $($src.Name)" -ForegroundColor Yellow
+                    Write-Host "✓ Renombrando: $($dest.Name) → $($src.Name)" -ForegroundColor Green
                     Rename-Item -Path $dest.FullName -NewName $src.Name -Force -ErrorAction Stop
-                    
-                    # Actualizar la lista de destino tras el renombramiento
-                    $dest.Name = $src.Name
                     $renombrados++
                 } catch {
-                    Write-Error "Error: $_"
+                    Write-Error "✗ Error: $_"
                     $noCoinciden++
                 }
             }
@@ -113,6 +144,8 @@ foreach ($src in $sourceFiles) {
     }
 }
 
-Write-Host "`nResumen:" -ForegroundColor Cyan
+Write-Host "`n════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "Resumen:" -ForegroundColor Cyan
 Write-Host "✓ Renombrados: $renombrados" -ForegroundColor Green
 Write-Host "✗ Problemas: $noCoinciden" -ForegroundColor Red
+Write-Host "════════════════════════════════════" -ForegroundColor Cyan
